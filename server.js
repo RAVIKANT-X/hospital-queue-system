@@ -3,11 +3,13 @@ require('dotenv').config();
 
 const express = require('express');
 const pool = require('./src/config/db');
+const doctorsRouter = require('./src/routes/doctors');
 
 const app = express();
 const port = process.env.PORT || 5000;
 
 app.use(express.json());
+app.use('/api/doctors', doctorsRouter);
 
 app.get('/health', (req, res) => {
   res.status(200).json({
