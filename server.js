@@ -1,9 +1,11 @@
 
-require('dotenv').config();
+
 
 const express = require('express');
 const pool = require('./src/config/db');
 const doctorsRouter = require('./src/routes/doctors');
+const appointmentsRouter = require('./src/routes/appointments');
+require('dotenv').config();
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -37,6 +39,11 @@ app.get('/db-health', async (req, res) => {
       message: 'Connection failed'
     });
   }
+});
+
+app.use('/api/appointments', appointmentsRouter);
+app.get('/debug-route', (req, res) => {
+  res.send('Debug route is working');
 });
 
 app.listen(port, () => {
