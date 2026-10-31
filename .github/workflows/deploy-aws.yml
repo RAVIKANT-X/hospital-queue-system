@@ -1,0 +1,231 @@
+name: Deploy to AWS (existing infrastructure)
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_aws_account_id:
+        description: Expected 12-digit AWS account ID; prevents deploying to the wrong account
+        required: true
+        type: string
+      aws_region:
+        description: AWS region
+        required: true
+        default: ap-south-1
+        type: string
+      api_url:
+        description: HTTPS API URL used by the frontend build and health checks
+        required: true
+        type: string
+      frontend_url:
+        description: HTTPS CloudFront URL used to verify the published frontend
+        required: true
+        type: string
+      api_ecr_repository:
+        description: Existing ECR repository for the API image
+        required: true
+        type: string
+      ecs_cluster:
+        description: Existing ECS cluster
+        required: true
+        type: string
+      ecs_service:
+        description: Existing ECS API service
+        required: true
+        type: string
+      api_container_name:
+        description: API container name in the ECS task definition
+        required: true
+        default: api
+        type: string
+      frontend_bucket:
+        description: Existing private frontend S3 bucket
+        required: true
+        type: string
+      cloudfront_distribution_id:
+        description: Existing CloudFront distribution
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hospital-queue-production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Validate deployment inputs
+        env:
+          EXPECTED_ACCOUNT_ID: ${{ inputs.expected_aws_account_id }}
+          API_URL: ${{ inputs.api_url }}
+          FRONTEND_URL: ${{ inputs.frontend_url }}
+        run: |
+          if [[ ! "$EXPECTED_ACCOUNT_ID" =~ ^[0-9]{12}$ ]]; then
+            echo "::error::Expected AWS account ID must contain exactly 12 digits."
+            exit 1
+          fi
+          case "$API_URL" in
+            https://*) ;;
+            *) echo "::error::API URL must use HTTPS."; exit 1 ;;
+          esac
+          case "$FRONTEND_URL" in
+            https://*) ;;
+            *) echo "::error::Frontend URL must use HTTPS."; exit 1 ;;
+          esac
+
+      - name: Install and test API
+        run: |
+          npm ci
+          npm test
+
+      - name: Build frontend
+        working-directory: client
+        env:
+          VITE_API_URL: ${{ inputs.api_url }}
+        run: |
+          npm ci
+          npm run build
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Verify AWS account and deployment targets
+        env:
+          EXPECTED_ACCOUNT_ID: ${{ inputs.expected_aws_account_id }}
+          CLUSTER: ${{ inputs.ecs_cluster }}
+          SERVICE: ${{ inputs.ecs_service }}
+          BUCKET: ${{ inputs.frontend_bucket }}
+          DISTRIBUTION: ${{ inputs.cloudfront_distribution_id }}
+        run: |
+          ACTUAL_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          if [ "$ACTUAL_ACCOUNT_ID" != "$EXPECTED_ACCOUNT_ID" ]; then
+            echo "::error::The assumed role belongs to a different AWS account."
+            exit 1
+          fi
+          aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
+            --query 'services[0].status' --output text | grep -qx ACTIVE
+          aws s3api head-bucket --bucket "$BUCKET"
+          aws cloudfront get-distribution --id "$DISTRIBUTION" \
+            --query 'Distribution.Status' --output text | grep -qx Deployed
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+
+      - name: Build and push immutable API image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          REPOSITORY: ${{ inputs.api_ecr_repository }}
+        run: |
+          docker build -t "$REGISTRY/$REPOSITORY:$GITHUB_SHA" .
+          docker push "$REGISTRY/$REPOSITORY:$GITHUB_SHA"
+
+      - name: Register immutable API task definition
+        id: register_task
+        env:
+          CLUSTER: ${{ inputs.ecs_cluster }}
+          SERVICE: ${{ inputs.ecs_service }}
+          CONTAINER: ${{ inputs.api_container_name }}
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ inputs.api_ecr_repository }}:${{ github.sha }}
+        run: |
+          set -euo pipefail
+          PREVIOUS_TASK_DEFINITION=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
+            --query 'services[0].taskDefinition' --output text)
+          if [ -z "$PREVIOUS_TASK_DEFINITION" ] || [ "$PREVIOUS_TASK_DEFINITION" = "None" ]; then
+            echo "::error::Could not determine the currently deployed task definition."
+            exit 1
+          fi
+          echo "previous_task_definition=$PREVIOUS_TASK_DEFINITION" >> "$GITHUB_OUTPUT"
+          aws ecs describe-task-definition --task-definition "$PREVIOUS_TASK_DEFINITION" \
+            --query taskDefinition > task-definition.json
+          jq --arg name "$CONTAINER" --arg image "$IMAGE" \
+            'if any(.containerDefinitions[]; .name == $name)
+             then (.containerDefinitions[] | select(.name == $name) | .image) = $image
+             else error("API container name was not found in the ECS task definition")
+             end
+             | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                   .compatibilities, .registeredAt, .registeredBy)' \
+            task-definition.json > task-definition-next.json
+          NEW_TASK_DEFINITION=$(aws ecs register-task-definition \
+            --cli-input-json file://task-definition-next.json \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "new_task_definition=$NEW_TASK_DEFINITION" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy API service
+        id: deploy_api
+        env:
+          CLUSTER: ${{ inputs.ecs_cluster }}
+          SERVICE: ${{ inputs.ecs_service }}
+          TASK_DEFINITION: ${{ steps.register_task.outputs.new_task_definition }}
+        run: |
+          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" \
+            --task-definition "$TASK_DEFINITION"
+
+      - name: Wait for API service stability
+        env:
+          CLUSTER: ${{ inputs.ecs_cluster }}
+          SERVICE: ${{ inputs.ecs_service }}
+        run: aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
+
+      - name: Verify API health, database, and auth configuration
+        id: verify_api
+        env:
+          API_URL: ${{ inputs.api_url }}
+        run: |
+          curl --fail --silent --show-error "$API_URL/health" > /dev/null
+          curl --fail --silent --show-error "$API_URL/db-health" > /dev/null
+          STATUS=$(curl --silent --output /dev/null --write-out "%{http_code}" \
+            --header "Content-Type: application/json" \
+            --data '{"username":"__deployment_check__","password":"invalid"}' \
+            "$API_URL/api/auth/login")
+          if [ "$STATUS" != "401" ]; then
+            echo "::error::Expected invalid credentials to return 401; received $STATUS."
+            exit 1
+          fi
+
+      - name: Roll back API after failed deployment verification
+        if: ${{ failure() && steps.register_task.outcome == 'success' && steps.deploy_api.outcome != 'skipped' && steps.verify_api.outcome != 'success' }}
+        env:
+          CLUSTER: ${{ inputs.ecs_cluster }}
+          SERVICE: ${{ inputs.ecs_service }}
+          PREVIOUS_TASK_DEFINITION: ${{ steps.register_task.outputs.previous_task_definition }}
+        run: |
+          if [ -z "$PREVIOUS_TASK_DEFINITION" ]; then
+            echo "::error::No previous task definition was recorded; rollback must be performed manually."
+            exit 1
+          fi
+          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" \
+            --task-definition "$PREVIOUS_TASK_DEFINITION"
+          aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
+
+      - name: Publish static frontend
+        env:
+          BUCKET: ${{ inputs.frontend_bucket }}
+          DISTRIBUTION: ${{ inputs.cloudfront_distribution_id }}
+        run: |
+          aws s3 sync client/dist "s3://$BUCKET" --exclude index.html \
+            --cache-control "public,max-age=31536000,immutable"
+          aws s3 cp client/dist/index.html "s3://$BUCKET/index.html" \
+            --cache-control "no-cache,no-store,must-revalidate"
+          aws cloudfront create-invalidation --distribution-id "$DISTRIBUTION" --paths "/*"
+
+      - name: Verify frontend
+        env:
+          FRONTEND_URL: ${{ inputs.frontend_url }}
+        run: curl --fail --silent --show-error --retry 5 --retry-delay 5 "$FRONTEND_URL" > /dev/null
